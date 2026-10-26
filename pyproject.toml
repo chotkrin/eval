@@ -1,0 +1,35 @@
+[project]
+name = "eval-math-lcb-direct"
+version = "0.1.0"
+description = "Single uv-managed inference environment for LLM-jp, Phi and DSDT"
+requires-python = "==3.13.5"
+dependencies = [
+    "vllm==0.30.0",
+    "llm-jp-vllm==0.1.1",
+    "sympy>=1.13.3,<1.15",
+    "antlr4-python3-runtime==4.11.1",
+    "latex2sympy2==1.9.0",  # Bundled implementation generated with ANTLR 4.11.1
+    "word2number",
+    "pebble",
+    "multiprocess",
+    "python-dateutil",
+    "timeout-decorator",
+    "regex",
+    "numpy",
+    "pandas",
+    "mpmath",
+    "tqdm",
+    "datasets",
+    "huggingface-hub",
+    # Optional NICT Ray dispatchers use this very same uv Python.
+    "ray[default]==2.56.1",
+    "trzsz>=1.1.7",
+]
+
+[tool.uv.sources]
+# Resolve the in-repository version, not PyPI latex2sympy2 1.9.1
+# (which requires antlr4-python3-runtime==4.7.2).
+latex2sympy2 = { path = "./latex2sympy" }
+
+[tool.uv]
+package = false
