@@ -31,6 +31,23 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
         print(f"max_num_samples: {max_num_samples} / {len(samples)}")
         samples = samples[:max_num_samples]
     
+    # ProofBench grades natural-language proofs against expert marking schemes.
+    # No mathematically meaningful pass@k exists until a proof grader is run.
+    # Keep the generated text and scores unassigned instead of reporting 0%.
+    if data_name in ("proofbench", "proofflowbench_proof"):
+        for sample in samples:
+            sample["score"] = [None] * len(sample["pred"])
+            sample["pass_at_k"] = {}
+        return samples, {"num_samples": len(samples),
+                         "num_scores": 0, "acc": None,
+                         "pass@1": None, "pass@5": None, "pass@10": None,
+                         "evaluation_status": "proof_grading_required",
+                         "scorer": "none; requires expert or validated proof checker"}
+
+    if data_name in ("proofflowbench_graph", "prmbench_error_steps"):
+        from structure_eval import evaluate_structured
+        return evaluate_structured(data_name, samples, ks=ks)
+
     # parse gt
     for sample in samples:
         sample['gt_cot'], sample['gt'] = parse_ground_truth(sample, data_name)
@@ -110,6 +127,23 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
         type_scores = {k: np.round(np.array(v).mean() * 100, decimals=1) for k, v in type_scores.items()}
         type_scores = {k: v for k, v in sorted(type_scores.items(), key=lambda item: item[0])}
         result_json['type_acc'] = type_scores
+
+    if data_name.startswith("processbench_"):
+        # Official ProcessBench metric: harmonic mean of accuracies on traces
+        # with an error (label != -1) and traces without one (label == -1).
+        # For n>1 we explicitly use candidate 0, not an implicit best-of-n.
+        error = [s["score"][0] for s in samples if str(s["gt"]) != "-1"]
+        correct = [s["score"][0] for s in samples if str(s["gt"]) == "-1"]
+        error_acc = 100 * sum(error) / len(error) if error else None
+        correct_acc = 100 * sum(correct) / len(correct) if correct else None
+        f1 = (2 * error_acc * correct_acc / (error_acc + correct_acc)
+              if error_acc is not None and correct_acc is not None and
+              (error_acc + correct_acc) > 0 else
+              0.0 if error_acc is not None and correct_acc is not None else None)
+        result_json.update({"processbench_error_acc": error_acc,
+                            "processbench_correct_acc": correct_acc,
+                            "processbench_f1": f1,
+                            "processbench_f1_sample_index": 0})
 
     print(result_json)
     return samples, result_json

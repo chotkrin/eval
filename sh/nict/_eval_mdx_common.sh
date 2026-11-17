@@ -78,6 +78,15 @@ mdx_prepare_shared_caches() {
     case ",${data_names}," in *",gpqa_diamond,"*) mdx_prepare_dataset_cache gpqa_diamond "${split}" ;; esac
     case ",${data_names}," in *",mmlu_stem,"*) mdx_prepare_dataset_cache mmlu_stem "${split}" ;; esac
     case ",${data_names}," in *",livecodebench_v6,"*) mdx_prepare_dataset_cache livecodebench_v6 "${split}" ;; esac
+    # Prebuild all requested transfer datasets in the login/submit environment,
+    # never concurrently on several GPU nodes.
+    local requested
+    for requested in gsm_plus gsm_plus_seed gsm_symbolic_main gsm_symbolic_p1 gsm_symbolic_p2 \
+        math_perturb_simple math_perturb_hard omega_exploratory \
+        omega_compositional omega_transformative processbench_gsm8k \
+        proofbench obligation_transfer; do
+        case ",${data_names}," in *",${requested},"*) mdx_prepare_dataset_cache "${requested}" "${split}" ;; esac
+    done
 }
 
 mdx_write_owner_json() {

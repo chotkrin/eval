@@ -60,8 +60,20 @@ class SharedUvSubmitterTest(unittest.TestCase):
                 encoding="utf-8",
             )
             sbatch.chmod(0o755)
-            env = dict(os.environ, EVAL_ENV_FILE=str(private))
-            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+            # Explicit test-only paths: a sourced real .env must never leak
+            # MODEL_ROOT / DATA_DIR into the mock Slurm submission.
+            env = {
+                "HOME": str(tmp),
+                "LANG": "C.UTF-8",
+                "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+                "EVAL_ENV_FILE": str(private),
+                "DATA_HOME": str(storage),
+                "DATA_DIR": str(storage / "data" / "eval"),
+                "MODEL_ROOT": str(models),
+                "EVAL_OUTPUTS": str(storage / "eval_outputs"),
+                "UV_PROJECT_ENVIRONMENT": str(venv),
+                "EVAL_CUDA_MODULE": "cuda/13.0/13.0.3",
+            }
             for script in SUBMITTERS:
                 with self.subTest(script=script):
                     result = subprocess.run(
@@ -115,12 +127,23 @@ class SharedUvSubmitterTest(unittest.TestCase):
                 f'UV_PROJECT_ENVIRONMENT="{venv}"\n'
                 'MAX_TASK_RETRIES="0"\n', encoding="utf-8",
             )
-            env = os.environ.copy()
-            env.update({
+            # Slurm exports a concrete checkout and absolute storage paths.
+            # Do not inherit unrelated variables from a shell that sourced
+            # the user's real .env (especially MODEL_ROOT and EVAL_OUTPUTS).
+            env = {
+                "HOME": str(tmp),
+                "LANG": "C.UTF-8",
+                "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
                 "PROJECT_ROOT": str(ROOT),
                 "EVAL_ENV_FILE": str(env_file),
-                "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
-            })
+                "DATA_HOME": str(data_home),
+                "DATA_DIR": str(data_home / "data" / "eval"),
+                "MODEL_ROOT": str(models),
+                "EVAL_OUTPUTS": str(data_home / "eval_outputs"),
+                "HF_HOME": str(data_home / "cache" / "huggingface"),
+                "UV_PROJECT_ENVIRONMENT": str(venv),
+                "EVAL_CUDA_MODULE": "cuda/13.0/13.0.3",
+            }
             for profile, evaluator in (
                 ("llmjp", "llmjp_eval.py"),
                 ("phi", "math_eval.py"),

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from llmjp_profile import (
     append_jsonl_durable, decode_response, make_prompt,
-    read_checkpoint, signature, make_user_prompt,
+    read_checkpoint, make_user_prompt,
 )
 from livecodebench_adapter import extract_python_program
 
@@ -85,11 +85,6 @@ class TestProtocol(unittest.TestCase):
             self.assertEqual(missing["final"], "")
             self.assertFalse(missing["has_final"])
             self.assertEqual(decode_response(Tokenizer(), [13])["final"], "print(3)")
-
-    def test_config_fingerprint(self):
-        self.assertEqual(signature({"a": 1, "b": 2}), signature({"b": 2, "a": 1}))
-        self.assertNotEqual(signature({"top_p": 0.9}), signature({"top_p": 0.95}))
-        self.assertNotEqual(signature({"n_sampling": 1}), signature({"n_sampling": 16}))
 
     def test_checkpoint_resume_and_invalid_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:

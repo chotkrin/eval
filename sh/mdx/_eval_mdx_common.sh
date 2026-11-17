@@ -46,9 +46,10 @@ export PROJECT_ROOT DATA_HOME DATA_DIR MODEL_ROOT EVAL_OUTPUTS UV_PROJECT_ENVIRO
 # The former LEGACY_EVAL_PYTHON / CUDA_MODULE_LEGACY entries in existing .env
 # files are intentionally ignored; users do NOT need to edit their .env.
 EVAL_PYTHON="${UV_PROJECT_ENVIRONMENT}/bin/python"
-EVAL_PROFILE="${EVAL_PROFILE:?Submit through eval.sh, eval_phi.sh or eval_llmjp.sh}"
+EVAL_PROFILE="${EVAL_PROFILE:?Submit through a model-specific eval_*.sh}"
 case "${EVAL_PROFILE}" in
     llmjp) MATH_EVAL_SCRIPT="${PROJECT_ROOT}/llmjp_eval.py" ;;
+    qwen) MATH_EVAL_SCRIPT="${PROJECT_ROOT}/qwen_eval.py" ;;
     phi|dsdt) MATH_EVAL_SCRIPT="${PROJECT_ROOT}/math_eval.py" ;;
     *) echo "ERROR: unknown EVAL_PROFILE=${EVAL_PROFILE}" >&2; exit 2 ;;
 esac
@@ -58,7 +59,8 @@ export EVAL_PYTHON MATH_EVAL_SCRIPT CUDA_MODULE
 
 MDX_PARTITION="${MDX_PARTITION:-gpu}"
 MDX_QOS="${MDX_QOS:-}"
-MDX_WALLTIME="${MDX_WALLTIME:-20:00:00}"
+# The obsolete MDX_WALLTIME in existing private .env files is ignored.
+# --time=0 requests an unlimited job duration, subject to Slurm policy.
 MDX_JOB_PREFIX="${MDX_JOB_PREFIX:-0001_eval}"
 MDX_MEM_PER_GPU_GB="${MDX_MEM_PER_GPU_GB:-32}"
 MAX_TASK_RETRIES="${MAX_TASK_RETRIES:-3}"
@@ -81,9 +83,50 @@ mdx_load_modules() {
         done
     fi
     command -v module >/dev/null 2>&1 || mdx_die "module command is unavailable on $(hostname)"
-    # vLLM 0.30.0 is a CUDA 13 build; all profiles must use its runtime.
+    # The normal profile adds a cluster CUDA module to LD_LIBRARY_PATH.
+    # A wheel with its own CUDA runtime may not need it.  'none' isolates
+    # this variable by purging *without* loading a different CUDA module.
     module purge
+    case "${CUDA_MODULE,,}" in
+        none|off|skip)
+            echo "[CUDA ENV] Module environment purged; CUDA module loading disabled"
+            return 0
+            ;;
+    esac
     module load "${CUDA_MODULE}"
+}
+
+mdx_preflight_cuda() {
+    # Separate process: never initialize CUDA in the vLLM parent, since vLLM
+    # starts additional worker processes and CUDA state must not leak across fork.
+    # This also distinguishes a basic PyTorch/Slurm failure from a vLLM bug.
+    "${EVAL_PYTHON}" - <<'PYTORCH_CUDA_PREFLIGHT'
+import os
+import sys
+import traceback
+
+visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+ids = [v.strip() for v in visible.split(",") if v.strip()]
+print(f"[CUDA PREFLIGHT] host={os.uname().nodename} visible={visible!r}", flush=True)
+try:
+    if not ids:
+        raise RuntimeError("CUDA_VISIBLE_DEVICES is empty or unset inside Slurm job")
+    import torch
+    print(f"[CUDA PREFLIGHT] torch={torch.__version__}, wheel_cuda={torch.version.cuda}", flush=True)
+    torch.cuda.init()
+    n = torch.cuda.device_count()
+    print(f"[CUDA PREFLIGHT] torch-visible devices={n}; Slurm list entries={len(ids)}", flush=True)
+    if n != len(ids):
+        raise RuntimeError(f"CUDA/Slurm visibility mismatch: torch={n}, CUDA_VISIBLE_DEVICES={visible!r}")
+    for idx in range(n):
+        z = torch.ones(1, device=f"cuda:{idx}")
+        torch.cuda.synchronize(idx)
+        print(f"[CUDA PREFLIGHT] gpu {idx}: {torch.cuda.get_device_name(idx)}; compute={z.item()}", flush=True)
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+print("[CUDA PREFLIGHT] PASS", flush=True)
+PYTORCH_CUDA_PREFLIGHT
 }
 
 mdx_sanitize_job_component() {
@@ -117,6 +160,17 @@ mdx_prepare_shared_caches() {
     case ",${data_names}," in *",gpqa_diamond,"*) mdx_prepare_dataset_cache gpqa_diamond "${split}" ;; esac
     case ",${data_names}," in *",mmlu_stem,"*) mdx_prepare_dataset_cache mmlu_stem "${split}" ;; esac
     case ",${data_names}," in *",livecodebench_v6,"*) mdx_prepare_dataset_cache livecodebench_v6 "${split}" ;; esac
+    # Prebuild all requested transfer datasets in the login/submit environment,
+    # never concurrently on several GPU nodes.
+    local requested
+    for requested in gsm_plus gsm_plus_seed gsm_symbolic_main gsm_symbolic_p1 gsm_symbolic_p2 \
+        math_perturb_simple math_perturb_hard omega_exploratory \
+        omega_compositional omega_transformative processbench_gsm8k \
+        processbench_math processbench_olympiadbench processbench_omnimath \
+        prmbench_error_steps proofflowbench_graph proofflowbench_proof \
+        proofbench obligation_transfer; do
+        case ",${data_names}," in *",${requested},"*) mdx_prepare_dataset_cache "${requested}" "${split}" ;; esac
+    done
 }
 
 mdx_write_owner_json() {
@@ -151,6 +205,8 @@ mdx_worker() {
     local temperature="0.6"
     local top_p="0.95"
     local top_k="20"
+    local min_p="0.0"
+    local presence_penalty="0.0"
     local start="0"
     local end="-1"
     local pipeline_parallel_size="1"
@@ -168,6 +224,8 @@ mdx_worker() {
             --temperature) temperature="$2"; shift 2 ;;
             --top-p) top_p="$2"; shift 2 ;;
             --top-k) top_k="$2"; shift 2 ;;
+            --min-p) min_p="$2"; shift 2 ;;
+            --presence-penalty) presence_penalty="$2"; shift 2 ;;
             --start) start="$2"; shift 2 ;;
             --end) end="$2"; shift 2 ;;
             --pipeline-parallel-size) pipeline_parallel_size="$2"; shift 2 ;;
@@ -218,6 +276,14 @@ mdx_worker() {
     echo "  output:           ${output_dir}"
     echo "======================================================"
     nvidia-smi || true
+    echo "  LD_LIBRARY_PATH:   ${LD_LIBRARY_PATH:-not-set}"
+    echo "  SLURM_JOB_GPUS:    ${SLURM_JOB_GPUS:-not-set}"
+
+    if [[ "${EVAL_CUDA_PREFLIGHT:-1}" == 1 ]]; then
+        if ! mdx_preflight_cuda 2>&1 | tee -a "${eval_log}"; then
+            mdx_die "CUDA preflight failed before vLLM. Check Slurm allocation, node/driver and CUDA module; use sh/mdx/diagnose_cuda.sbatch to compare environments. No model evaluation was attempted."
+        fi
+    fi
 
     local cmd=(
         "${EVAL_PYTHON}" -u "${MATH_EVAL_SCRIPT}"
@@ -239,7 +305,7 @@ mdx_worker() {
         --pipeline_parallel_size "${pipeline_parallel_size}"
     )
 
-    if [[ "${EVAL_PROFILE}" != llmjp ]]; then
+    if [[ "${EVAL_PROFILE}" == phi || "${EVAL_PROFILE}" == dsdt ]]; then
         cmd+=(--use_vllm --apply_chat_template --save_outputs)
     fi
 
@@ -247,6 +313,10 @@ mdx_worker() {
         cmd+=(--reasoning_effort "${LLMJP_REASONING_EFFORT:-high}"
               --question_batch_size "${LLMJP_QUESTION_BATCH_SIZE:-4}"
               --max_model_len "${LLMJP_MAX_MODEL_LEN:-65536}")
+    elif [[ "${EVAL_PROFILE}" == qwen ]]; then
+        cmd+=(--min_p "${min_p}" --presence_penalty "${presence_penalty}"
+              --question_batch_size "${QWEN_QUESTION_BATCH_SIZE:-4}"
+              --max_model_len "${QWEN_MAX_MODEL_LEN:-40960}")
     fi
 
     local max_attempts=$((MAX_TASK_RETRIES + 1))
@@ -332,7 +402,7 @@ mdx_submit_experiments() {
         --gres="gpu:${GPUS_PER_EXP}"
         --cpus-per-task="${CPUS_PER_EXP}"
         --mem="${mem_gb}G"
-        --time="${MDX_WALLTIME}"
+        --time=0
         --requeue
         --chdir="${PROJECT_ROOT}"
         --export="ALL,PROJECT_ROOT=${PROJECT_ROOT},DATA_HOME=${DATA_HOME},DATA_DIR=${DATA_DIR},MODEL_ROOT=${MODEL_ROOT},EVAL_OUTPUTS=${EVAL_OUTPUTS},EVAL_PYTHON=${EVAL_PYTHON},MATH_EVAL_SCRIPT=${MATH_EVAL_SCRIPT},CUDA_MODULE=${CUDA_MODULE},EVAL_PROFILE=${EVAL_PROFILE},UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}"
@@ -346,18 +416,25 @@ mdx_submit_experiments() {
     echo "  GPUs/experiment:  ${GPUS_PER_EXP}"
     echo "  CPUs/experiment:  ${CPUS_PER_EXP}"
     echo "  memory/job:       ${mem_gb}G"
+    echo "  requested time:   --time=0 (subject to Slurm partition/QoS limits)"
     echo "  data names:       ${DATA_NAMES}"
     echo "  manifest:         ${manifest}"
     echo "======================================================"
 
+    # Site job-name policy (example: 0009_train-172b):
+    # four digits, underscore, job category, dash, four hex characters.
+    # Preserve the experiment label in the log filename and manifest instead.
+    if [[ ! "${MDX_JOB_PREFIX}" =~ ^[0-9]{4}_[A-Za-z][A-Za-z0-9]*$ ]]; then
+        mdx_die "MDX_JOB_PREFIX must look like 0001_eval (current: ${MDX_JOB_PREFIX})"
+    fi
     local -a job_ids=()
     local idx=0 job_name exp_tag log_pattern job_id
     for exp_name in "${EXP_NAMES[@]}"; do
         idx=$((idx + 1))
+        ((idx <= 65535)) || mdx_die "Too many experiments for four-hex-digit Slurm job suffix"
         exp_tag="$(mdx_sanitize_job_component "${exp_name}")"
-        job_name="${MDX_JOB_PREFIX}-${idx}-${exp_tag}"
-        job_name="${job_name:0:96}"
-        log_pattern="${log_dir}/${job_name}_%j.out"
+        printf -v job_name '%s-%04x' "${MDX_JOB_PREFIX}" "${idx}"
+        log_pattern="${log_dir}/${job_name}-${exp_tag}_%j.out"
 
         job_id="$(
             "${sbatch_base[@]}" \
@@ -376,6 +453,8 @@ mdx_submit_experiments() {
                 --temperature "${TEMPERATURE}" \
                 --top-p "${TOP_P}" \
                 --top-k "${TOP_K}" \
+                --min-p "${MIN_P:-0.0}" \
+                --presence-penalty "${PRESENCE_PENALTY:-0.0}" \
                 --start "${START}" \
                 --end "${END}" \
                 --pipeline-parallel-size "${PIPELINE_PARALLEL_SIZE}"
@@ -401,6 +480,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         shift
         mdx_worker "$@"
     else
-        mdx_die "_eval_mdx_common.sh is internal; run eval.sh, eval_phi.sh or eval_llmjp.sh"
+        mdx_die "_eval_mdx_common.sh is internal; run a model-specific eval_*.sh"
     fi
 fi

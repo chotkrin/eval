@@ -247,6 +247,10 @@ def main(llm, tokenizer, data_name, args):
             "platform",
             "difficulty",
             "starter_code",
+            "family_id", "variant", "transfer_type", "source_dataset", "source_id",
+            "schema_id", "obligation_ids", "obligation_types", "annotation_status",
+            "first_error_index", "reference_solution", "marking_scheme",
+            "node_ids", "gold_edge_count", "gold_proof_graph", "step_count", "annotation_scope",
         ]:
             if key in example:
                 sample[key] = example[key]
@@ -405,6 +409,8 @@ def main(llm, tokenizer, data_name, args):
         preds = [item[0] for item in result]
         reports = [item[1] for item in result]
         for j in range(len(preds)):
+            if data_name in ("proofbench", "proofflowbench_proof"):
+                continue  # no answer-choice cleanup for free-form proofs
             if sample["gt"] in ["A", "B", "C", "D", "E"] and preds[j] not in [
                 "A",
                 "B",
@@ -432,7 +438,14 @@ def main(llm, tokenizer, data_name, args):
     # add processed samples
     all_samples.extend(processed_samples)
 
-    if data_name.startswith("livecodebench_"):
+    if data_name in ("proofbench", "proofflowbench_proof"):
+        # ProofBench is a proof-generation dataset, NOT an answer-string benchmark.
+        # Preserve all traces for later expert/rubric grading, never fake accuracy.
+        total_generations = sum(len(s.get("code", [])) for s in all_samples)
+        result_json = {"num_samples": len(all_samples), "num_scores": 0,
+                       "acc": None, "evaluation_status": "proof_grading_required",
+                       "num_generations": total_generations}
+    elif data_name.startswith("livecodebench_"):
         # Export an official custom-evaluator input.  Correctness is intentionally
         # left pending until this file is scored inside a CPU sandbox.
         custom_output_file = out_file.replace(".jsonl", "_lcb_custom.json")

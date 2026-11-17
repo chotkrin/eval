@@ -5,7 +5,6 @@ Model-specific Harmony parsing operates on token IDs, not output.text.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -17,6 +16,15 @@ CHOICE_DATASETS = frozenset({
 
 
 def make_user_prompt(question: str, data_name: str) -> str:
+    if data_name in ("proofbench", "proofflowbench_proof"):
+        return (
+            "Write a rigorous, complete natural-language mathematical proof "
+            "of the following statement. Justify each step; do not substitute "
+            "an unsupported final numerical answer for a proof.\n\n" + question
+        )
+    if data_name in ("proofflowbench_graph", "prmbench_error_steps"):
+        return ("Audit the mathematical reasoning carefully. Follow the output JSON "
+                "schema included in the question exactly; do not use LaTeX boxed answers.\n\n" + question)
     if data_name.startswith("livecodebench_"):
         return (
             "Solve the following programming problem. Reason carefully. "
@@ -85,11 +93,6 @@ def decode_response(tokenizer, token_ids: list[int]):
     }
 
 
-def signature(config: dict) -> str:
-    encoded = json.dumps(config, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
-
-
 def write_json_atomic(path: Path, data: dict) -> None:
     temp = path.with_name(path.name + ".tmp")
     with temp.open("w", encoding="utf-8") as out:
@@ -138,8 +141,11 @@ def read_checkpoint(path: Path, n_sampling: int) -> dict[int, dict]:
                 print(f"[LLM-jp] Recovering interrupted checkpoint tail: {path}:{lineno}", flush=True)
                 inp.truncate(position)
                 break
-            if len(sample.get("code", [])) != n_sampling or len(sample.get("pred", [])) != n_sampling:
-                raise ValueError(f"Incomplete n_sampling in {path}:{lineno}")
+            if not isinstance(sample, dict) or "idx" not in sample or not all(
+                isinstance(sample.get(key), list) and len(sample[key]) == n_sampling
+                for key in ("code", "pred")
+            ):
+                raise ValueError(f"Invalid/incomplete question checkpoint in {path}:{lineno}")
             idx = sample["idx"]
             if idx in out:
                 raise ValueError(f"Duplicate sample idx={idx} in checkpoint {path}")

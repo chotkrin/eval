@@ -21,7 +21,11 @@ SPLIT="test"
 NUM_TEST_SAMPLE=-1
 PROMPT_TYPE="qwen25-math-cot"
 DATA_DIR="${RAY_DATA_HOME:?Set RAY_DATA_HOME in .env}/data/eval"
-# DATA_NAMES="math500,aime24,minerva_math,olympiadbench,amc23,aime26,gpqa_diamond,mmlu_stem,livecodebench_v6"
+# # Transfer evaluation datasets (optional). Keep obligation_transfer disabled until generated.
+# DATA_NAMES="gsm_plus,gsm_plus_seed,gsm_symbolic_main,gsm_symbolic_p1,gsm_symbolic_p2,math_perturb_simple,math_perturb_hard,omega_exploratory,omega_compositional,omega_transformative"
+# DATA_NAMES="processbench_gsm8k,proofbench"
+# DATA_NAMES="obligation_transfer"
+DATA_NAMES="math500,aime24,minerva_math,olympiadbench,amc23,aime26,gpqa_diamond,mmlu_stem,livecodebench_v6"
 DATA_NAMES="math500,aime24,minerva_math,olympiadbench,amc23,aime26,gpqa_diamond,mmlu_stem,livecodebench_v6"
 
 # Each experiment independently requests these resources from Ray.

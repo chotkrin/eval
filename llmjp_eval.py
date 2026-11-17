@@ -16,7 +16,10 @@ from evaluate import evaluate
 from livecodebench_adapter import export_custom_outputs, extract_python_program
 from llmjp_profile import (
     PROFILE_VERSION, append_jsonl_durable, decode_response, make_prompt,
-    read_checkpoint, signature, write_json_atomic,
+    read_checkpoint, write_json_atomic,
+)
+from llmjp_storage import (
+    normalize_config, read_protocol, migrate_one, candidates, archive_root_files,
 )
 from parser import parse_ground_truth, parse_question, run_execute, choice_answer_clean
 
@@ -36,6 +39,8 @@ def arguments():
     p.add_argument("--n_sampling", type=int, default=16)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--top_k", type=int, default=-1)
+    p.add_argument("--min_p", type=float, default=0.0)
+    p.add_argument("--presence_penalty", type=float, default=0.0)
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--end", type=int, default=-1)
     p.add_argument("--pipeline_parallel_size", type=int, default=1)
@@ -44,13 +49,15 @@ def arguments():
     p.add_argument("--max_model_len", type=int, default=65536)
     p.add_argument("--overwrite", action="store_true")
     a = p.parse_args()
-    if a.prompt_type != "llmjp4-harmony":
-        p.error("LLM-jp entrypoint requires --prompt_type llmjp4-harmony")
+    if a.prompt_type not in ("llmjp4-harmony", "qwen3-thinking", "qwen35-thinking"):
+        p.error("unsupported prompt_type: expected llmjp4-harmony, qwen3-thinking or qwen35-thinking")
+    if a.prompt_type != "llmjp4-harmony" and not os.environ.get("QWEN_EVAL_ENTRYPOINT"):
+        p.error("Qwen evaluation must use qwen_eval.py")
     if a.question_batch_size < 1 or a.n_sampling < 1 or a.max_tokens_per_call < 1:
         p.error("batch size, n_sampling, max_tokens must be positive")
     if a.pipeline_parallel_size < 1:
         p.error("pipeline parallel size must be positive")
-    if not 0 <= a.temperature or not 0 < a.top_p <= 1:
+    if not 0 <= a.temperature or not 0 < a.top_p <= 1 or not 0 <= a.min_p <= 1:
         p.error("invalid sampling parameters")
     return a
 
@@ -69,31 +76,13 @@ def base_sample(example, data_name):
         "level", "type", "unit", "solution_type", "choices", "solution", "ques_type", "ans_type",
         "answer_type", "dataset", "subfield", "filed", "theorem", "answer", "question_id",
         "question_title", "contest_id", "contest_date", "platform", "difficulty", "starter_code",
+        "family_id", "variant", "transfer_type", "source_dataset", "source_id", "schema_id",
+        "reference_solution", "marking_scheme", "first_error_index",
+        "node_ids", "gold_edge_count", "gold_proof_graph", "step_count", "annotation_scope",
     ):
         if key in example:
             sample[key] = example[key]
     return sample
-
-
-def model_identity(path):
-    p = Path(path).resolve()
-    # Model weights may be replaced in-place after RL training. Include cheap
-    # weight file metadata so that an updated checkpoint invalidates the cache.
-    weights = []
-    for mask in ("*.safetensors", "*.bin"):
-        for f in sorted(p.glob(mask)):
-            stat = f.stat()
-            weights.append([f.name, stat.st_size, stat.st_mtime_ns])
-    return {"path": str(p), "config_sha256": sha256_path(p / "config.json"),
-            "tokenizer_config_sha256": sha256_path(p / "tokenizer_config.json"),
-            "weights": weights}
-
-
-def sha256_path(path):
-    import hashlib
-    if not path.exists():
-        return "missing"
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def eval_one_dataset(args, llm, tokenizer, name, version_info):
@@ -104,66 +93,99 @@ def eval_one_dataset(args, llm, tokenizer, name, version_info):
     samples = [x for x in (base_sample(dict(e), name) for e in source) if x is not None]
     if len({s['idx'] for s in samples}) != len(samples):
         raise ValueError(f"Duplicate benchmark indices in {name}")
-    import hashlib
-    source_identity = hashlib.sha256(json.dumps(
-        samples,
-        ensure_ascii=False, sort_keys=True, default=str,
-    ).encode("utf-8")).hexdigest()
-    # Invalidate cache when grading, prompts, or parsing changes.
-    code_dir = Path(__file__).resolve().parent
-    code_hasher = hashlib.sha256()
-    for filename in ("llmjp_eval.py", "llmjp_profile.py", "parser.py", "grader.py",
-                     "evaluate.py", "data_loader.py", "livecodebench_adapter.py"):
-        code_hasher.update(filename.encode("utf-8"))
-        code_hasher.update((code_dir / filename).read_bytes())
-    env_lock = code_dir / "uv.lock"
+    # The dataset directory is the only output directory (no llmjp4/ layer).
+    is_qwen = getattr(args, "prompt_type", "llmjp4-harmony").startswith("qwen")
+    if is_qwen:
+        from qwen_profile import profile_version, make_prompt as qwen_prompt, decode_response as qwen_decode
+        protocol_version = profile_version(args.prompt_type)
+    else:
+        protocol_version = PROFILE_VERSION
     config = {
-        "evaluator_code_sha256": code_hasher.hexdigest(),
-        "environment_lock_sha256": sha256_path(env_lock),
-        "benchmark_content_sha256": source_identity,
-        "protocol": PROFILE_VERSION, "model": model_identity(args.model_name_or_path),
-        "dataset": name, "split": args.split, "data_dir": str(Path(args.data_dir).resolve()),
+        "protocol": protocol_version, "model": str(Path(args.model_name_or_path).resolve()),
+        "dataset": name, "split": args.split,
         "num_test_sample": args.num_test_sample, "start": args.start, "end": args.end,
         "seed": args.seed, "temperature": args.temperature, "top_p": args.top_p,
         "top_k": args.top_k, "n_sampling": args.n_sampling,
         "max_tokens_per_call": args.max_tokens_per_call, "max_model_len": args.max_model_len,
-        "reasoning_effort": args.reasoning_effort, "versions": version_info,
+        "reasoning_effort": args.reasoning_effort,
     }
-    output_root = Path(args.output_dir) / name / ("llmjp4_" + signature(config))
+    # Existing LLM-jp protocol.json files remain byte-compatible on resume.
+    # Qwen's model-specific generation settings must be checked separately.
+    if is_qwen:
+        config.update({"reasoning_effort": None, "prompt_type": args.prompt_type,
+                       "min_p": args.min_p, "presence_penalty": args.presence_penalty})
+    output_root = Path(args.output_dir) / name
     output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # GPQA item text and ground truth may be subject to redistribution limits.
-    output_root.chmod(0o700)
+    # A worker already owns the experiment lock. Historical subfolders must
+    # be flattened before checkpoint recovery, including an earlier llmjp4/.
+    if any(run.directory != output_root for run in candidates(output_root, args.n_sampling)):
+        selection = migrate_one(output_root, args.n_sampling, apply=True)
+        if selection["status"] == "invalid":
+            raise ValueError(f"Cannot migrate corrupt checkpoint in {name}: {selection}")
+        print(f"[LLM-jp] {name}: migration {selection}", flush=True)
     meta_file = output_root / "protocol.json"
-    if meta_file.exists():
-        if json.loads(meta_file.read_text(encoding="utf-8")) != config:
-            raise ValueError("Checkpoint fingerprint collision or changed evaluation configuration")
-    else:
+    # Fail closed when there is existing run data but protocol has been lost.
+    # On --overwrite archive only this dataset's LLM-jp files; unrelated
+    # Phi/DSDT outputs (e.g. *_metrics.json) remain where they are.
+    has_previous = bool((output_root / "protocol.json").exists() or
+                        (output_root / "generations.jsonl").exists() or
+                        (output_root / "metrics.json").exists())
+    previous = read_protocol(output_root) if has_previous else None
+    if has_previous and previous != normalize_config(config) and not args.overwrite:
+        raise ValueError(
+            f"Existing checkpoint cannot be resumed with different sampling/model settings: {output_root}. "
+            "Inspect protocol.json; use --overwrite to archive and start a new run."
+        )
+    if has_previous and args.overwrite:
+        archive_root_files(output_root)
+    output_root.chmod(0o700)
+    if not meta_file.is_file():
         write_json_atomic(meta_file, config)
     out_file = output_root / "generations.jsonl"
     metrics_file = output_root / "metrics.json"
-    if args.overwrite:
-        out_file.unlink(missing_ok=True)
-        metrics_file.unlink(missing_ok=True)
     processed = read_checkpoint(out_file, args.n_sampling)
     expected_ids = {s['idx'] for s in samples}
     if not set(processed).issubset(expected_ids):
         raise ValueError("Checkpoint contains samples outside selected range")
+    # idx alone is not sufficient: the benchmark file may have been edited.
+    expected = {s["idx"]: s for s in samples}
+    for idx, saved in processed.items():
+        if saved.get("question") != expected[idx]["question"] or saved.get("gt") != expected[idx]["gt"]:
+            raise ValueError(f"Checkpoint question/answer mismatch at idx={idx}; refusing unsafe resume")
     pending = [s for s in samples if s['idx'] not in processed]
     print(f"[LLM-jp] {name}: total={len(samples)} completed={len(processed)} remaining={len(pending)}", flush=True)
     if not samples:
         raise ValueError(f"Empty benchmark: {name}")
     if not pending and metrics_file.exists():
-        return json.loads(metrics_file.read_text(encoding="utf-8"))
+        metrics = json.loads(metrics_file.read_text(encoding="utf-8"))
+        # Scoring is cacheable only when it is newer than the generations it
+        # describes; a replaced/appended checkpoint invalidates prior metrics.
+        if (metrics.get("num_samples") == len(samples) and
+                metrics_file.stat().st_mtime_ns >= out_file.stat().st_mtime_ns):
+            if not name.startswith("livecodebench_") or (output_root / "lcb_custom.json").is_file():
+                return metrics
+    if pending and metrics_file.exists():
+        # A stale score must not masquerade as a finished evaluation.
+        metrics_file.unlink()
 
     from vllm import SamplingParams
-    stop_id = tokenizer.convert_tokens_to_ids("<|return|>")
-    if not isinstance(stop_id, int) or stop_id < 0 or stop_id == getattr(tokenizer, "unk_token_id", None):
-        raise ValueError("LLM-jp tokenizer has no <|return|> stop token")
+    if is_qwen:
+        stop_id = tokenizer.eos_token_id
+        if not isinstance(stop_id, int) or stop_id < 0:
+            raise ValueError("Qwen tokenizer has no valid EOS token")
+    else:
+        stop_id = tokenizer.convert_tokens_to_ids("<|return|>")
+        if not isinstance(stop_id, int) or stop_id < 0 or stop_id == getattr(tokenizer, "unk_token_id", None):
+            raise ValueError("LLM-jp tokenizer has no <|return|> stop token")
     from tqdm import tqdm
     start = time.monotonic()
     for i in tqdm(range(0, len(pending), args.question_batch_size), desc=name):
         batch = pending[i:i + args.question_batch_size]
-        prompts = [make_prompt(tokenizer, s["question"], name, args.reasoning_effort) for s in batch]
+        prompts = [
+            qwen_prompt(tokenizer, s["question"], name) if is_qwen
+            else make_prompt(tokenizer, s["question"], name, args.reasoning_effort)
+            for s in batch
+        ]
         prompt_tokens = [len(tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts]
         for sample, tokens in zip(batch, prompt_tokens):
             if tokens + args.max_tokens_per_call > args.max_model_len:
@@ -174,6 +196,8 @@ def eval_one_dataset(args, llm, tokenizer, name, version_info):
         params = SamplingParams(
             n=args.n_sampling, seed=args.seed, temperature=args.temperature,
             top_p=args.top_p, top_k=args.top_k, max_tokens=args.max_tokens_per_call,
+            min_p=args.min_p if is_qwen else 0.0,
+            presence_penalty=args.presence_penalty if is_qwen else 0.0,
             stop_token_ids=[stop_id], detokenize=False, skip_special_tokens=False,
         )
         generated = llm.generate(prompts, params, use_tqdm=False)
@@ -190,7 +214,7 @@ def eval_one_dataset(args, llm, tokenizer, name, version_info):
             generations, preds, reports, reasoning, raws, finishes, lengths, valid = [], [], [], [], [], [], [], []
             for candidate in sorted(req.outputs, key=lambda x: x.index):
                 ids = list(candidate.token_ids)
-                parsed = decode_response(tokenizer, ids)
+                parsed = qwen_decode(tokenizer, ids) if is_qwen else decode_response(tokenizer, ids)
                 # A token-limit truncation is an incorrect/incomplete response,
                 # even if a partial final answer was already emitted.
                 is_valid = parsed["has_final"] and candidate.finish_reason == "stop"
@@ -210,12 +234,14 @@ def eval_one_dataset(args, llm, tokenizer, name, version_info):
                 finishes.append(candidate.finish_reason)
                 lengths.append(len(ids))
                 valid.append(is_valid)
-            completed.append({**sample, "prompt_tokens": prompt_len,
+            record = {**sample, "prompt_tokens": prompt_len,
                 "code": generations, "pred": preds, "report": reports,
-                "reasoning": reasoning, "raw_harmony": raws,
+                "reasoning": reasoning,
                 "finish_reason": finishes, "valid_final": valid,
                 "completion_tokens_per_sample": lengths,
-                "completion_tokens": sum(lengths)})
+                "completion_tokens": sum(lengths)}
+            record["raw_qwen" if is_qwen else "raw_harmony"] = raws
+            completed.append(record)
         # Save complete questions after each successful vLLM batch; requeues
         # skip them and never mix candidates with different configurations.
         append_jsonl_durable(out_file, completed)
@@ -237,7 +263,7 @@ def eval_one_dataset(args, llm, tokenizer, name, version_info):
         save_jsonl(all_samples, str(scored_path))
     total_generations = sum(len(s["code"]) for s in all_samples)
     total_tokens = sum(s["completion_tokens"] for s in all_samples)
-    result.update({"protocol": PROFILE_VERSION, "output_dir": str(output_root),
+    result.update({"protocol": protocol_version, "output_dir": str(output_root),
                    "num_generations": total_generations,
                    "avg_completion_tokens": total_tokens / total_generations,
                    "missing_final": sum(not v for s in all_samples for v in s['valid_final']),
@@ -264,10 +290,14 @@ def main():
               max_model_len=args.max_model_len, seed=args.seed)
     tokenizer = llm.get_tokenizer()
     vocab = tokenizer.get_vocab()
-    for marker in ("<|start|>", "<|message|>", "<|channel|>", "<|constrain|>",
-                   "<|end|>", "<|return|>", "<|call|>"):
-        if marker not in vocab:
-            raise RuntimeError(f"Model tokenizer lacks LLM-jp Harmony marker {marker}")
+    if args.prompt_type == "llmjp4-harmony":
+        for marker in ("<|start|>", "<|message|>", "<|channel|>", "<|constrain|>",
+                       "<|end|>", "<|return|>", "<|call|>"):
+            if marker not in vocab:
+                raise RuntimeError(f"Model tokenizer lacks LLM-jp Harmony marker {marker}")
+    else:
+        from qwen_profile import validate_qwen_tokenizer
+        validate_qwen_tokenizer(tokenizer)
     scores = []
     for name in args.data_names.split(","):
         result = eval_one_dataset(args, llm, tokenizer, name, versions)

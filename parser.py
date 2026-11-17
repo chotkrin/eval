@@ -573,6 +573,8 @@ STRIP_EXCEPTIONS = ["carp_en", "minerva_math"]
 
 
 def parse_ground_truth(example: Dict[str, Any], data_name):
+    if data_name in ("proofflowbench_graph", "proofflowbench_proof", "prmbench_error_steps"):
+        return str(example.get("gt_cot", "")), str(example.get("gt", ""))
     if "gt_cot" in example and "gt" in example:
         if data_name in ["math"]:
             gt_ans = extract_answer(example["gt_cot"], data_name)
@@ -581,6 +583,9 @@ def parse_ground_truth(example: Dict[str, Any], data_name):
         else:
             gt_ans = strip_string(example["gt"])
         return example["gt_cot"], gt_ans
+
+    if data_name in __import__("transfer_datasets").TRANSFER_DATASETS:
+        return str(example.get("gt_cot", "")), str(example.get("gt", ""))
 
     # parse ground truth
     if data_name in ["math", "minerva_math", "math500"]:  #关键代码
@@ -749,6 +754,8 @@ def run_execute(executor, result, prompt_type, data_name, execute=False):
     if not result or result == "error":
         return None, None
     report = None
+    if data_name in ("proofflowbench_graph", "proofflowbench_proof", "prmbench_error_steps"):
+        return result.strip(), None  # preserve structured JSON and raw proofs
 
     if "program_only" in prompt_type:
         prediction = extract_program_output(result)

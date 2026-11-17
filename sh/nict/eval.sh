@@ -12,6 +12,10 @@ SAMPLE_NUM=16
 SPLIT="test"
 NUM_TEST_SAMPLE=-1
 PROMPT_TYPE="qwen25-math-cot"
+# Transfer evaluation datasets (optional). Keep obligation_transfer disabled until generated.
+# DATA_NAMES="gsm_plus,gsm_plus_seed,gsm_symbolic_main,gsm_symbolic_p1,gsm_symbolic_p2,math_perturb_simple,math_perturb_hard,omega_exploratory,omega_compositional,omega_transformative"
+# DATA_NAMES="processbench_gsm8k,proofbench"
+# DATA_NAMES="obligation_transfer"
 DATA_NAMES="math500,aime24,minerva_math,olympiadbench,amc23,aime26,gpqa_diamond,mmlu_stem,livecodebench_v6"
 MAX_TOKENS_PER_CALL=38912
 SEED=42

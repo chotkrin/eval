@@ -13,7 +13,21 @@ SAMPLE_NUM=16
 SPLIT="test"
 NUM_TEST_SAMPLE=-1
 PROMPT_TYPE="qwen25-math-cot"
-DATA_NAMES="math500,aime24,minerva_math,olympiadbench,amc23,aime26,gpqa_diamond,mmlu_stem,livecodebench_v6"
+# DATA_NAMES="math500,aime24,minerva_math,olympiadbench,amc23,aime26,gpqa_diamond,mmlu_stem,livecodebench_v6"
+# Optional answer-checkable robustness datasets (uncomment after download):
+# DATA_NAMES="${DATA_NAMES},gsm_plus,gsm_plus_seed,gsm_symbolic_main,gsm_symbolic_p1,gsm_symbolic_p2,math_perturb_simple,math_perturb_hard"
+DATA_NAMES="gsm_plus,gsm_plus_seed,gsm_symbolic_main,gsm_symbolic_p1,gsm_symbolic_p2,math_perturb_simple,math_perturb_hard"
+# Download first:
+#   bash sh/mdx/download_extra_datasets.sh  (or sh/synka/download_extra_datasets.sh)
+# ProcessBench uses error-step F1, not Math answer accuracy; run separately:
+# DATA_NAMES="processbench_gsm8k,processbench_math,processbench_olympiadbench"
+# ProofBench generates proofs, but automated proof accuracy is NOT available:
+# DATA_NAMES="proofbench"
+# DATA_NAMES="proofflowbench_graph,proofflowbench_proof,prmbench_error_steps,processbench_omnimath"
+# OMEGA requires locally generated, solver-validated exports:
+# DATA_NAMES="omega_exploratory,omega_compositional,omega_transformative"
+# DATA_NAMES="obligation_transfer"  # locally generated only
+
 MAX_TOKENS_PER_CALL=38912
 SEED=42
 TEMPERATURE=0.6
@@ -29,12 +43,13 @@ CPUS_PER_EXP=64
 
 # Same list style as sh/nict/eval_ray.sh: uncomment/add as many experiments as needed.
 EXP_NAMES=(
+  "DAPO-DSDT-1.5B-0"
   # "DAPO-DSDT-1.5B-RELAXED-LASER-L2048-a0.5"
   # "DAPO-DSDT-1.5B-RELAXED-LASER-L2048-a1.25"
-  "DAPO-DSDT-1.5B-LASER-L1024-a1.25"
+  # "DAPO-DSDT-1.5B-LASER-L1024-a1.25"
   # "DAPO-DSDT-1.5B-LASER-L2048-a1.25"
-  "DAPO-DSDT-1.5B-LASER-L3072-a1.25"
-  "DAPO-DSDT-1.5B-LASER-L4096-a1.25"
+  # "DAPO-DSDT-1.5B-LASER-L3072-a1.25"
+  # "DAPO-DSDT-1.5B-LASER-L4096-a1.25"
   # "DAPO-DSDT-1.5B-LP-C-1.5e-4"
   # "DAPO-DSDT-1.5B-LP-C-1e-3"
   # "DAPO-DSDT-1.5B-LP-C-3e-4"

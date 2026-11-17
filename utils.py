@@ -200,6 +200,21 @@ PROMPT_TEMPLATES = {
 
 
 def construct_prompt(example, data_name, args):
+    if data_name in ("proofflowbench_graph", "prmbench_error_steps", "proofflowbench_proof"):
+        # Most legacy math templates (including qwen25-math-cot) force a boxed
+        # numeric answer. Never place that instruction above a JSON/proof task.
+        task = example["question"]
+        if data_name == "proofflowbench_proof":
+            system = "Produce a rigorous and complete mathematical proof; no boxed final number is needed."
+        else:
+            system = "Audit the mathematical reasoning; output ONLY the specified JSON object."
+        if args.prompt_type in ("qwen25-math-cot", "qwen3-math-cot", "qwen-boxed"):
+            return ("<|im_start|>system\n" + system + "<|im_end|>\n"
+                    "<|im_start|>user\n" + task + "<|im_end|>\n"
+                    "<|im_start|>assistant\n")
+        if args.prompt_type == "phi4-mini-reasoning":
+            return system + "\n\n" + task
+        return system + "\n\n" + task
     if data_name.startswith("livecodebench_"):
         # Keep LiveCodeBench in CoT mode for reasoning-model evaluation, while
         # making the final executable program easy for the official evaluator

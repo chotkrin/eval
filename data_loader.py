@@ -4,6 +4,7 @@ import random
 import datasets
 from datasets import load_dataset, Dataset, concatenate_datasets
 from utils import load_jsonl, lower_keys
+from transfer_datasets import TRANSFER_DATASETS, prepare as prepare_transfer
 
 
 def load_data(data_name, split, data_dir="./data"):
@@ -11,7 +12,10 @@ def load_data(data_name, split, data_dir="./data"):
     if os.path.exists(data_file):
         examples = list(load_jsonl(data_file))
     else:
-        if data_name == "math":
+        if data_name in TRANSFER_DATASETS:
+            examples = prepare_transfer(data_name, data_dir, split)
+            return sorted(examples, key=lambda x: x["idx"])
+        elif data_name == "math":
             dataset = load_dataset(
                 "competition_math",
                 split=split,
